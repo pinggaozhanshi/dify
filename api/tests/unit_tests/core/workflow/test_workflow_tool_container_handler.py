@@ -651,6 +651,76 @@ class TestWorkflowToolContainerCases:
             runtime_state.get_container_frame("invocation:workflow-tool")
 
     @staticmethod
+    def test_workflow_tool_handler_returns_image_mapping_as_file(monkeypatch: pytest.MonkeyPatch) -> None:
+        """A child Code node's image mapping becomes a typed file in the parent's tool output."""
+        image_url = "https://example.com/image.png"
+        references = [
+            {
+                "dify_model_identity": "__dify__file__",
+                "type": "image",
+                "transfer_method": "remote_url",
+                "url": image_url,
+            }
+        ]
+        code_outputs = {"references": references}
+        monkeypatch.setattr(
+            "core.workflow.node_factory.CodeExecutor.execute_workflow_code_template",
+            lambda **_: code_outputs,
+        )
+        monkeypatch.setattr(
+            "factories.file_factory.builders.get_remote_file_info",
+            lambda _url: ("image/png", "image.png", 1024),
+        )
+        handler, frame_registry, runtime_state, request, sources = _workflow_tool_container_container_handler()
+        source_graph = sources["source-workflow"].graph_config
+        source_graph["nodes"].insert(
+            1,
+            {
+                "id": "source-code",
+                "data": {
+                    "type": "code",
+                    "title": "Code",
+                    "code_language": "python3",
+                    "code": f"def main(): return {code_outputs!r}",
+                    "outputs": {"references": {"type": "array[object]"}},
+                    "variables": [],
+                },
+            },
+        )
+        source_graph["nodes"][-1]["data"]["outputs"] = [
+            {"variable": "references", "value_selector": ["source-code", "references"]}
+        ]
+        source_graph["edges"] = [
+            {"id": "start-code", "source": "source-start", "target": "source-code"},
+            {"id": "code-end", "source": "source-code", "target": "source-end"},
+        ]
+        handler.handle_request(invocation_id="invocation", request=request)
+        processor = NodeEventProcessor(
+            graph_execution=runtime_state.graph_execution,
+            event_stream=EventStream(layers=[]),
+            frame_registry=frame_registry,
+            container_handlers={BuiltinNodeTypes.TOOL: handler},
+        )
+        for node_id in ("source-start", "source-code", "source-end"):
+            _dispatch_next_node(
+                expected_node_id=node_id,
+                runtime_state=runtime_state,
+                frame_registry=frame_registry,
+                processor=processor,
+            )
+
+        resume_task = runtime_state.ready_queue.get(timeout=0.01)
+        assert isinstance(resume_task, ResumeTask)
+        assert isinstance(resume_task.result, ContainerExecutionResult)
+        outputs = resume_task.result.node_run_result.outputs
+        assert outputs["references"].to_object() == references
+        files = outputs["files"]
+        assert isinstance(files, ArrayFileSegment)
+        assert len(files.value) == 1
+        assert files.value[0].type == "image"
+        assert files.value[0].remote_url == image_url
+
+    @staticmethod
     def test_workflow_tool_handler_restores_child_failure() -> None:
         handler, frame_registry, runtime_state, request, source_repository = (
             _workflow_tool_container_container_handler()
